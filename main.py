@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import sys
-import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -43,100 +42,83 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-TOUR_AVG_RETURN = 0.22  # Rough approximation for ATP Tour Average Return On Service
+TOUR_AVG_RETURN = 0.22 
 
 # --- Parsing Logic (TennisAbstract On-Demand) ---
 
 def player_to_url(name: str) -> str:
-    """Daniil Medvedev -> https://www.tennisabstract.com/cgi-bin/player.cgi?p=DaniilMedvedev"""
     camel_case = "".join(filter(str.isalnum, name.title()))
     return f"https://www.tennisabstract.com/cgi-bin/player.cgi?p={camel_case}"
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 async def fetch_player_stats(player_name: str, target_surface: str) -> Tuple[float, float, int]:
-    """
-    Parses player profile on TennisAbstract and returns weighted Hold% and Return%.
-    target_surface mapping: 'Hard', 'Grass', 'Indoor Hard'
-    """
     url = player_to_url(player_name)
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
     
-    logger.info(f"Parsing stats for {player_name}...")
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                logger.error(f"Failed to fetch {url}: status {resp.status}")
-                return 0.0, 0.0, 0
-            html = await resp.text()
+    logger.info(f"Scraping stats for {player_name}...")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200: return 0.0, 0.0, 0
+                html = await resp.text()
+    except Exception as e:
+        logger.error(f"Network error for {player_name}: {e}")
+        return 0.0, 0.0, 0
 
     soup = BeautifulSoup(html, 'lxml')
     table = soup.find('table', {'id': 'matches'})
-    if not table:
-        logger.warning(f"No match table found for {player_name}")
-        return 0.0, 0.0, 0
+    if not table: return 0.0, 0.0, 0
 
     holds, returns, weights = [], [], []
     now = datetime.now()
     cutoff_52_weeks = now - timedelta(days=365)
-    cutoff_60_days = now - timedelta(days=60)
-
-    # Table rows: skip header
+    
     rows = table.find_all('tr')[1:]
+    
+    # Сначала найдем дату последнего матча для динамического WMA
+    all_match_dates = []
     for row in rows:
         cells = row.find_all('td')
         if len(cells) < 15: continue
-
         try:
-            # Date format usually: YYYY-MM-DD
-            match_date_str = cells[0].text.strip()
-            match_date = datetime.strptime(match_date_str, '%Y-%m-%d')
-            if match_date < cutoff_52_weeks: break # Assume rows are sorted by date descending
+            m_date = datetime.strptime(cells[0].text.strip(), '%Y-%m-%d')
+            all_match_dates.append(m_date)
+        except: continue
+    
+    if not all_match_dates: return 0.0, 0.0, 0
+    latest_match_date = max(all_match_dates)
+    cutoff_60_days = latest_match_date - timedelta(days=60)
 
-            # Surface
+    for row in rows:
+        cells = row.find_all('td')
+        if len(cells) < 15: continue
+        try:
+            match_date = datetime.strptime(cells[0].text.strip(), '%Y-%m-%d')
+            if match_date < cutoff_52_weeks: break 
+
             surface = cells[4].text.strip()
-            # Normalize surface names
-            # TennisAbstract: 'Hard', 'Grass', 'I.Hard', 'Clay'
-            norm_surface = surface
-            if surface == 'I.Hard': norm_surface = 'Indoor Hard'
+            norm_surface = 'Indoor Hard' if surface == 'I.Hard' else surface
             
             if norm_surface != target_surface:
-                # If target is Indoor Hard, we can also accept I.Hard
-                if target_surface == 'Indoor Hard' and surface == 'I.Hard':
-                    pass
-                else:
-                    continue
+                if not (target_surface == 'Indoor Hard' and surface == 'I.Hard'): continue
 
-            # Stats: Svw (Serve points won%), Rtw (Return points won%)
-            # Usually cells[13] is Svw, cells[14] is Rtw in 'matches' table
             svw_str = cells[13].text.strip().replace('%', '')
             rtw_str = cells[14].text.strip().replace('%', '')
-            
             if not svw_str or not rtw_str: continue
             
-            svw = float(svw_str) / 100.0
-            rtw = float(rtw_str) / 100.0
-            
+            svw, rtw = float(svw_str) / 100.0, float(rtw_str) / 100.0
             weight = 2 if match_date >= cutoff_60_days else 1
             
-            holds.append(svw)
-            returns.append(rtw)
-            weights.append(weight)
-        except Exception as e:
-            continue
+            holds.append(svw); returns.append(rtw); weights.append(weight)
+        except: continue
 
-    if len(holds) < 15:
-        logger.info(f"Not enough matches for {player_name} on {target_surface} ({len(holds)})")
-        return 0.0, 0.0, len(holds)
+    if len(holds) < 15: return 0.0, 0.0, len(holds)
+    return np.average(holds, weights=weights), np.average(returns, weights=weights), len(holds)
 
-    w_hold = np.average(holds, weights=weights)
-    w_ret = np.average(returns, weights=weights)
-    
-    return w_hold, w_ret, len(holds)
-
-# --- Odds & Weather API ---
+# --- API Integrations ---
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
-async def get_weather(city: str, lat: float, lon: float, start_time: datetime) -> Optional[float]:
+async def get_weather(lat: float, lon: float, start_time: datetime) -> Optional[float]:
     url = "https://api.open-meteo.com/v1/forecast"
     params = {"latitude": lat, "longitude": lon, "hourly": "wind_speed_10m", "timezone": "auto", "start_date": start_time.strftime("%Y-%m-%d"), "end_date": start_time.strftime("%Y-%m-%d")}
     async with aiohttp.ClientSession() as session:
@@ -160,31 +142,19 @@ async def get_active_atp_sports() -> List[str]:
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 async def get_odds(sport_slug: str) -> List[dict]:
     url = f"https://api.the-odds-api.com/v4/sports/{sport_slug}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY, 
-        "regions": "eu", 
-        "markets": "alternate_total_games_1st_set,totals_1st_set,totals,h2h", 
-        "oddsFormat": "decimal"
-    }
+    params = {"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "alternate_total_games_1st_set,totals_1st_set,totals,h2h", "oddsFormat": "decimal"}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
-            if resp.status == 200: 
-                return await resp.json()
-            else:
-                error_text = await resp.text()
-                logger.error(f"Odds API Error for {sport_slug}: {resp.status} - {error_text}")
+            if resp.status == 200: return await resp.json()
+            logger.error(f"Odds API Error {sport_slug}: {resp.status}")
     return []
 
-# --- Calculations & Math ---
-
 def calculate_match_probability(hold_a: float, hold_b: float) -> float:
-    p_a_5_5 = binom.pmf(5, 5, hold_a)
-    p_a_4_5 = binom.pmf(4, 5, hold_a)
-    p_b_5_5 = binom.pmf(5, 5, hold_b)
-    p_b_4_5 = binom.pmf(4, 5, hold_b)
+    p_a_5_5 = binom.pmf(5, 5, hold_a); p_a_4_5 = binom.pmf(4, 5, hold_a)
+    p_b_5_5 = binom.pmf(5, 5, hold_b); p_b_4_5 = binom.pmf(4, 5, hold_b)
     return (p_a_5_5 * p_b_5_5) + (p_a_4_5 * p_b_4_5)
 
-# --- PocketBase & Bot Handlers ---
+# --- PocketBase ---
 
 class PocketBaseClient:
     def __init__(self, url, email, password):
@@ -197,58 +167,37 @@ class PocketBaseClient:
                 if resp.status == 200:
                     data = await resp.json(); self.token = data["token"]
                     logger.info("PB Authenticated successfully")
-                else: logger.error(f"PB Auth failed: {await resp.text()}")
 
     async def save_signal(self, data: dict):
         if not self.token: await self.authenticate()
         headers = {"Authorization": f"Bearer {self.token}"}
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{self.url}/api/collections/signals/records", json=data, headers=headers) as resp:
-                if resp.status != 200: logger.error(f"Failed to save signal to PB: {await resp.text()}")
+                if resp.status != 200: logger.error(f"PB Save fail: {await resp.text()}")
 
 pb_client = PocketBaseClient(PB_URL, PB_EMAIL, PB_PASSWORD)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🎾 Теннисный бот (ATP Scraping On-Demand) запущен.\nИспользуйте /status для статистики.")
+    await message.answer("🎾 Теннисный бот (Scraping mode) запущен.\nИспользуйте /status.")
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     conn_status = "✅ OK" if pb_client.token else "❌ No Auth"
     text = (f"📊 <b>Статистика воронки:</b>\n- Проверено матчей: {stats_funnel['total_matches']}\n- Отсеяно по покрытию: {stats_funnel['skipped_surface']}\n"
-            f"- Отсеяно по холду: {stats_funnel['skipped_hold']}\n- Отсеяно по погоде: {stats_funnel['skipped_weather']}\n- Выдано алертов: {stats_funnel['alerts_sent']}\n\n🔗 <b>PocketBase:</b> {conn_status}")
+            f"- Отсеяно по холду: {stats_funnel['skipped_hold']}\n- Отсеяно по погоде: {stats_funnel['skipped_weather']}\n- Выдано алертов: {stats_funnel['alerts_sent']}\n\n🔗 <b>PB Connection:</b> {conn_status}")
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 # --- Main Engine ---
 
-TOURNAMENT_LOCATIONS = {
-    "Australian Open": (37.8136, 144.9631), "Wimbledon": (51.4343, 0.2145), "French Open": (48.8475, 2.2492),
-    "US Open": (40.7500, -73.8467), "Indian Wells": (33.7233, -116.3750), "Miami": (25.9581, -80.2389),
-    "Monte Carlo": (43.7483, 7.4331), "Madrid": (40.4168, -3.7038), "Rome": (41.9028, 12.4964),
-}
-
-SURFACE_MAPPING = {
-    "Australian Open": "Hard", "Wimbledon": "Grass", "French Open": "Clay", "US Open": "Hard",
-    "Indian Wells": "Hard", "Miami": "Hard", "Monte Carlo": "Clay", "Madrid": "Clay", "Rome": "Clay",
-}
-
-def get_tournament_surface(sport_title: str) -> str:
-    for name, surface in SURFACE_MAPPING.items():
-        if name.lower() in sport_title.lower(): return surface
-    return "Hard"
-
-def get_tournament_coords(sport_title: str) -> Tuple[float, float]:
-    for name, coords in TOURNAMENT_LOCATIONS.items():
-        if name.lower() in sport_title.lower(): return coords
-    return (0.0, 0.0)
+TOURNAMENT_LOCATIONS = {"Australian Open": (37.8136, 144.9631), "Wimbledon": (51.4343, 0.2145), "French Open": (48.8475, 2.2492), "US Open": (40.7500, -73.8467), "Indian Wells": (33.7233, -116.3750), "Miami": (25.9581, -80.2389), "Monte Carlo": (43.7483, 7.4331), "Madrid": (40.4168, -3.7038), "Rome": (41.9028, 12.4964)}
+SURFACE_MAPPING = {"Australian Open": "Hard", "Wimbledon": "Grass", "French Open": "Clay", "US Open": "Hard", "Indian Wells": "Hard", "Miami": "Hard", "Monte Carlo": "Clay", "Madrid": "Clay", "Rome": "Clay"}
 
 async def scan_matches(bot: Bot):
     logger.info("Starting scan cycle...")
     active_sports = await get_active_atp_sports()
-    if not active_sports:
-        logger.warning("No active ATP sports found.")
-        return
+    if not active_sports: return
 
     for sport_slug in active_sports:
         odds_data = await get_odds(sport_slug)
@@ -257,14 +206,14 @@ async def scan_matches(bot: Bot):
         for match in odds_data:
             stats_funnel["total_matches"] += 1
             sport_title = match.get('sport_title', 'Unknown')
-            surface = get_tournament_surface(sport_title)
+            surface = "Hard"
+            for name, s in SURFACE_MAPPING.items():
+                if name.lower() in sport_title.lower(): surface = s; break
             
             if surface not in ["Hard", "Grass", "Indoor Hard", "Carpet"]:
                 stats_funnel["skipped_surface"] += 1; continue
                 
             p1, p2 = match['home_team'], match['away_team']
-            
-            # Parsing On-Demand
             h1, r1, count1 = await fetch_player_stats(p1, surface)
             h2, r2, count2 = await fetch_player_stats(p2, surface)
             
@@ -279,10 +228,12 @@ async def scan_matches(bot: Bot):
                 
             wind_speed = 0
             if surface in ["Hard", "Grass"]:
-                lat, lon = get_tournament_coords(sport_title)
-                match_time = datetime.fromisoformat(match['commence_time'].replace('Z', '+00:00'))
+                lat, lon = 0.0, 0.0
+                for name, coords in TOURNAMENT_LOCATIONS.items():
+                    if name.lower() in sport_title.lower(): lat, lon = coords; break
                 if lat != 0.0:
-                    wind_speed = await get_weather(sport_title, lat, lon, match_time)
+                    match_time = datetime.fromisoformat(match['commence_time'].replace('Z', '+00:00'))
+                    wind_speed = await get_weather(lat, lon, match_time)
                     if wind_speed and wind_speed > 20:
                         stats_funnel["skipped_weather"] += 1; continue
 
@@ -309,13 +260,10 @@ async def scan_matches(bot: Bot):
                 admin_id = os.getenv("ADMIN_ID")
                 if admin_id:
                     try: await bot.send_message(admin_id, alert_text, parse_mode=ParseMode.HTML)
-                    except Exception as e: logger.error(f"Failed to send alert: {e}")
+                    except: pass
                 
                 await pb_client.save_signal({"match": f"{p1} vs {p2}", "predicted_prob": round(float(p_total), 4), "fair_odds": round(float(fair_odds), 2), "bookmaker_odds": float(best_odds), "bookmaker_name": bookie_name, "timestamp": datetime.now().isoformat()})
                 stats_funnel["alerts_sent"] += 1
-                logger.info(f"ALERT SENT: {p1} vs {p2}")
-    
-    logger.info(f"Cycle complete. Total processed: {stats_funnel['total_matches']}")
 
 async def main():
     bot = Bot(token=BOT_TOKEN)
@@ -323,7 +271,7 @@ async def main():
     async def loop_scanner():
         while True:
             try: await scan_matches(bot)
-            except Exception as e: logger.exception(f"Error in scanner loop: {e}")
+            except Exception as e: logger.exception(f"Error: {e}")
             await asyncio.sleep(3600)
     asyncio.create_task(loop_scanner())
     await dp.start_polling(bot)
