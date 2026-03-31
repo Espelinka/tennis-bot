@@ -248,31 +248,43 @@ async def get_weather(city: str, lat: float, lon: float, start_time: datetime) -
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 async def get_odds() -> List[dict]:
-    url = f"https://api.the-odds-api.com/v4/sports/tennis_atp/odds/"
-    # Try alternate market first
+    # Correct slug for ATP is often 'tennis_atp'
+    # To be safe, let's use a variable we can easily change
+    sport_slug = "tennis_atp"
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_slug}/odds"
+    
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
         "markets": "alternate_total_games_1st_set",
         "oddsFormat": "decimal"
     }
+    
     async with aiohttp.ClientSession() as session:
+        # First, let's just log ALL available sports if we get a 404
         async with session.get(url, params=params) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                logger.info(f"Odds API returned {len(data)} matches for 1st set totals")
-                if data:
-                    return data
+                logger.info(f"Odds API returned {len(data)} matches for {sport_slug}")
+                return data
+            elif resp.status == 404:
+                logger.warning(f"Sport {sport_slug} not found. Fetching available sports list...")
+                sports_url = "https://api.the-odds-api.com/v4/sports"
+                async with session.get(sports_url, params={"apiKey": ODDS_API_KEY}) as s_resp:
+                    if s_resp.status == 200:
+                        all_sports = await s_resp.json()
+                        tennis_sports = [s['key'] for s in all_sports if 'tennis' in s['key']]
+                        logger.info(f"Available tennis sports: {tennis_sports}")
+                        # If we found other tennis sports, we could try them, but let's just log for now
             else:
                 logger.error(f"Odds API error: {resp.status} - {await resp.text()}")
 
-        # Fallback to main H2H just to see if matches exist at all
-        logger.info("Retrying with h2h market to check match availability...")
+        # Fallback to main H2H for the same slug
+        logger.info(f"Retrying {sport_slug} with h2h market...")
         params["markets"] = "h2h"
         async with session.get(url, params=params) as resp_fallback:
             if resp_fallback.status == 200:
                 data = await resp_fallback.json()
-                logger.info(f"Odds API returned {len(data)} matches for h2h")
                 return data
     return []
 
