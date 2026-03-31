@@ -249,24 +249,32 @@ async def get_weather(city: str, lat: float, lon: float, start_time: datetime) -
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 async def get_odds() -> List[dict]:
     url = f"https://api.the-odds-api.com/v4/sports/tennis_atp/odds/"
+    # Try alternate market first
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
-        "markets": "alternate_total_games_1st_set", # Specific market for 1st set totals
+        "markets": "alternate_total_games_1st_set",
         "oddsFormat": "decimal"
     }
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                if not data:
-                    # Fallback to main totals if 1st set not available (though not perfect for the strategy)
-                    params["markets"] = "totals"
-                    async with session.get(url, params=params) as resp_fallback:
-                        if resp_fallback.status == 200:
-                            return await resp_fallback.json()
+                logger.info(f"Odds API returned {len(data)} matches for 1st set totals")
+                if data:
+                    return data
+            else:
+                logger.error(f"Odds API error: {resp.status} - {await resp.text()}")
+
+        # Fallback to main H2H just to see if matches exist at all
+        logger.info("Retrying with h2h market to check match availability...")
+        params["markets"] = "h2h"
+        async with session.get(url, params=params) as resp_fallback:
+            if resp_fallback.status == 200:
+                data = await resp_fallback.json()
+                logger.info(f"Odds API returned {len(data)} matches for h2h")
                 return data
-            return []
+    return []
 
 # --- PocketBase Integration ---
 
