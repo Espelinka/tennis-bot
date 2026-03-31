@@ -67,13 +67,26 @@ async def get_combined_stats() -> pd.DataFrame:
     if datetime.now() < _stats_cache["expiry"] and not _stats_cache["df"].empty:
         return _stats_cache["df"]
 
-    current_year = datetime.now().year
-    df_current = await download_csv(current_year)
-    df_prev = await download_csv(current_year - 1)
-    combined = pd.concat([df_current, df_prev], ignore_index=True)
+    # Try current and previous years, fallback to 2024/2023 if 404
+    years_to_try = [2026, 2025, 2024, 2023]
+    dfs = []
     
+    for year in years_to_try:
+        df = await download_csv(year)
+        if not df.empty:
+            dfs.append(df)
+        
+        # We need at least 2 years of data for 52-week coverage
+        if len(dfs) >= 2:
+            break
+            
+    if not dfs:
+        logger.error("No data could be downloaded from Sackmann repo!")
+        return pd.DataFrame()
+
+    combined = pd.concat(dfs, ignore_index=True)
     _stats_cache["df"] = combined
-    _stats_cache["expiry"] = datetime.now() + timedelta(hours=24) # Cache for 24h
+    _stats_cache["expiry"] = datetime.now() + timedelta(hours=24)
     return combined
 
 # Mapping of major ATP tournament locations to coordinates
