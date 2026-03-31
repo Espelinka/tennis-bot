@@ -2,12 +2,13 @@ import asyncio
 import logging
 import os
 import sys
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
-import pandas as pd
 import numpy as np
+from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
@@ -42,135 +43,97 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-SACKMANN_BASE_URL = "https://raw.githubusercontent.com/JeffSackmann/tennis_atp/master/"
 TOUR_AVG_RETURN = 0.22  # Rough approximation for ATP Tour Average Return On Service
 
-# --- Data Loading & Management ---
-_stats_cache = {"df": pd.DataFrame(), "expiry": datetime.min}
+# --- Parsing Logic (TennisAbstract On-Demand) ---
 
-async def download_csv(year: int) -> pd.DataFrame:
-    url = f"{SACKMANN_BASE_URL}atp_matches_{year}.csv"
-    logger.info(f"Downloading data for year {year}...")
+def player_to_url(name: str) -> str:
+    """Daniil Medvedev -> https://www.tennisabstract.com/cgi-bin/player.cgi?p=DaniilMedvedev"""
+    camel_case = "".join(filter(str.isalnum, name.title()))
+    return f"https://www.tennisabstract.com/cgi-bin/player.cgi?p={camel_case}"
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
+async def fetch_player_stats(player_name: str, target_surface: str) -> Tuple[float, float, int]:
+    """
+    Parses player profile on TennisAbstract and returns weighted Hold% and Return%.
+    target_surface mapping: 'Hard', 'Grass', 'Indoor Hard'
+    """
+    url = player_to_url(player_name)
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+    
+    logger.info(f"Parsing stats for {player_name}...")
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                text = await response.text()
-                from io import StringIO
-                df = pd.read_csv(StringIO(text))
-                return df
-            else:
-                logger.error(f"Failed to download {url}: {response.status}")
-                return pd.DataFrame()
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.error(f"Failed to fetch {url}: status {resp.status}")
+                return 0.0, 0.0, 0
+            html = await resp.text()
 
-async def get_combined_stats() -> pd.DataFrame:
-    global _stats_cache
-    if datetime.now() < _stats_cache["expiry"] and not _stats_cache["df"].empty:
-        return _stats_cache["df"]
+    soup = BeautifulSoup(html, 'lxml')
+    table = soup.find('table', {'id': 'matches'})
+    if not table:
+        logger.warning(f"No match table found for {player_name}")
+        return 0.0, 0.0, 0
 
-    years_to_try = [2026, 2025, 2024, 2023]
-    dfs = []
-    for year in years_to_try:
-        df = await download_csv(year)
-        if not df.empty:
-            dfs.append(df)
-        if len(dfs) >= 2:
-            break
-            
-    if not dfs:
-        logger.error("No data could be downloaded from Sackmann repo!")
-        return pd.DataFrame()
-
-    combined = pd.concat(dfs, ignore_index=True)
-    _stats_cache["df"] = combined
-    _stats_cache["expiry"] = datetime.now() + timedelta(hours=24)
-    return combined
-
-# Mapping of major ATP tournament locations to coordinates
-TOURNAMENT_LOCATIONS = {
-    "Australian Open": (37.8136, 144.9631),
-    "Wimbledon": (51.4343, 0.2145),
-    "French Open": (48.8475, 2.2492),
-    "US Open": (40.7500, -73.8467),
-    "Indian Wells": (33.7233, -116.3750),
-    "Miami": (25.9581, -80.2389),
-    "Monte Carlo": (43.7483, 7.4331),
-    "Madrid": (40.4168, -3.7038),
-    "Rome": (41.9028, 12.4964),
-    "Canada": (43.6532, -79.3832),
-    "Cincinnati": (39.1031, -84.5120),
-    "Shanghai": (31.2304, 121.4737),
-    "Paris": (48.8566, 2.3522),
-    "Dubai": (25.2048, 55.2708),
-    "Doha": (25.2854, 51.5310),
-}
-
-SURFACE_MAPPING = {
-    "Australian Open": "Hard",
-    "Wimbledon": "Grass",
-    "French Open": "Clay",
-    "US Open": "Hard",
-    "Indian Wells": "Hard",
-    "Miami": "Hard",
-    "Monte Carlo": "Clay",
-    "Madrid": "Clay",
-    "Rome": "Clay",
-    "Paris": "Indoor Hard",
-}
-
-def get_tournament_surface(sport_title: str) -> str:
-    for name, surface in SURFACE_MAPPING.items():
-        if name.lower() in sport_title.lower():
-            return surface
-    return "Hard"
-
-def get_tournament_coords(sport_title: str) -> Tuple[float, float]:
-    for name, coords in TOURNAMENT_LOCATIONS.items():
-        if name.lower() in sport_title.lower():
-            return coords
-    return (0.0, 0.0)
-
-def normalize_name(name: str) -> str:
-    return name.strip().title()
-
-def calculate_weighted_stats(player_name: str, surface: str, df: pd.DataFrame) -> Tuple[float, float, int]:
-    p_matches = df[((df['winner_name'] == player_name) | (df['loser_name'] == player_name)) & (df['surface'] == surface)].copy()
-    if len(p_matches) < 15:
-        return 0.0, 0.0, len(p_matches)
-
-    p_matches['date'] = pd.to_datetime(p_matches['tourney_date'], format='%Y%m%d')
-    
-    # ПРАВКА GEMINI: Динамический расчет cutoff_date от последнего матча в базе
-    latest_match_date = p_matches['date'].max()
-    cutoff_date = latest_match_date - timedelta(days=60)
-    
     holds, returns, weights = [], [], []
-    for _, row in p_matches.iterrows():
-        weight = 2 if row['date'] >= cutoff_date else 1
+    now = datetime.now()
+    cutoff_52_weeks = now - timedelta(days=365)
+    cutoff_60_days = now - timedelta(days=60)
+
+    # Table rows: skip header
+    rows = table.find_all('tr')[1:]
+    for row in rows:
+        cells = row.find_all('td')
+        if len(cells) < 15: continue
+
         try:
-            if row['winner_name'] == player_name:
-                if row['w_svpt'] > 0:
-                    hold_pct = (row['w_1stWon'] + row['w_2ndWon']) / row['w_svpt']
-                    ret_pct = (row['l_svpt'] - (row['l_1stWon'] + row['l_2ndWon'])) / row['l_svpt']
-                else: continue
-            else:
-                if row['l_svpt'] > 0:
-                    hold_pct = (row['l_1stWon'] + row['l_2ndWon']) / row['l_svpt']
-                    ret_pct = (row['w_svpt'] - (row['w_1stWon'] + row['w_2ndWon'])) / row['w_svpt']
-                else: continue
-            holds.append(hold_pct); returns.append(ret_pct); weights.append(weight)
-        except Exception: continue
+            # Date format usually: YYYY-MM-DD
+            match_date_str = cells[0].text.strip()
+            match_date = datetime.strptime(match_date_str, '%Y-%m-%d')
+            if match_date < cutoff_52_weeks: break # Assume rows are sorted by date descending
 
-    if not holds: return 0.0, 0.0, 0
-    return np.average(holds, weights=weights), np.average(returns, weights=weights), len(holds)
+            # Surface
+            surface = cells[4].text.strip()
+            # Normalize surface names
+            # TennisAbstract: 'Hard', 'Grass', 'I.Hard', 'Clay'
+            norm_surface = surface
+            if surface == 'I.Hard': norm_surface = 'Indoor Hard'
+            
+            if norm_surface != target_surface:
+                # If target is Indoor Hard, we can also accept I.Hard
+                if target_surface == 'Indoor Hard' and surface == 'I.Hard':
+                    pass
+                else:
+                    continue
 
-def calculate_match_probability(hold_a: float, hold_b: float) -> float:
-    p_a_5_5 = binom.pmf(5, 5, hold_a)
-    p_a_4_5 = binom.pmf(4, 5, hold_a)
-    p_b_5_5 = binom.pmf(5, 5, hold_b)
-    p_b_4_5 = binom.pmf(4, 5, hold_b)
-    return (p_a_5_5 * p_b_5_5) + (p_a_4_5 * p_b_4_5)
+            # Stats: Svw (Serve points won%), Rtw (Return points won%)
+            # Usually cells[13] is Svw, cells[14] is Rtw in 'matches' table
+            svw_str = cells[13].text.strip().replace('%', '')
+            rtw_str = cells[14].text.strip().replace('%', '')
+            
+            if not svw_str or not rtw_str: continue
+            
+            svw = float(svw_str) / 100.0
+            rtw = float(rtw_str) / 100.0
+            
+            weight = 2 if match_date >= cutoff_60_days else 1
+            
+            holds.append(svw)
+            returns.append(rtw)
+            weights.append(weight)
+        except Exception as e:
+            continue
 
-# --- API Integrations ---
+    if len(holds) < 15:
+        logger.info(f"Not enough matches for {player_name} on {target_surface} ({len(holds)})")
+        return 0.0, 0.0, len(holds)
+
+    w_hold = np.average(holds, weights=weights)
+    w_ret = np.average(returns, weights=weights)
+    
+    return w_hold, w_ret, len(holds)
+
+# --- Odds & Weather API ---
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 async def get_weather(city: str, lat: float, lon: float, start_time: datetime) -> Optional[float]:
@@ -185,20 +148,18 @@ async def get_weather(city: str, lat: float, lon: float, start_time: datetime) -
                     return data["hourly"]["wind_speed_10m"][hour_idx]
     return None
 
-async def get_active_tennis_sports() -> List[str]:
+async def get_active_atp_sports() -> List[str]:
     url = "https://api.the-odds-api.com/v4/sports"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params={"apiKey": ODDS_API_KEY}) as resp:
             if resp.status == 200:
                 all_sports = await resp.json()
-                # ПРАВКА GEMINI: Фильтруем только ATP турниры
                 return [s['key'] for s in all_sports if s['key'].startswith('tennis_atp') and s['active']]
     return []
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 async def get_odds(sport_slug: str) -> List[dict]:
     url = f"https://api.the-odds-api.com/v4/sports/{sport_slug}/odds"
-    # ПРАВКА GEMINI: Расширяем список маркетов
     params = {
         "apiKey": ODDS_API_KEY, 
         "regions": "eu", 
@@ -214,7 +175,16 @@ async def get_odds(sport_slug: str) -> List[dict]:
                 logger.error(f"Odds API Error for {sport_slug}: {resp.status} - {error_text}")
     return []
 
-# --- PocketBase Integration ---
+# --- Calculations & Math ---
+
+def calculate_match_probability(hold_a: float, hold_b: float) -> float:
+    p_a_5_5 = binom.pmf(5, 5, hold_a)
+    p_a_4_5 = binom.pmf(4, 5, hold_a)
+    p_b_5_5 = binom.pmf(5, 5, hold_b)
+    p_b_4_5 = binom.pmf(4, 5, hold_b)
+    return (p_a_5_5 * p_b_5_5) + (p_a_4_5 * p_b_4_5)
+
+# --- PocketBase & Bot Handlers ---
 
 class PocketBaseClient:
     def __init__(self, url, email, password):
@@ -237,12 +207,11 @@ class PocketBaseClient:
                 if resp.status != 200: logger.error(f"Failed to save signal to PB: {await resp.text()}")
 
 pb_client = PocketBaseClient(PB_URL, PB_EMAIL, PB_PASSWORD)
-
-# --- Bot Handlers ---
 dp = Dispatcher()
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🎾 Теннисный бот (ATP Value Betting) запущен.\nИспользуйте /status для статистики.")
+    await message.answer("🎾 Теннисный бот (ATP Scraping On-Demand) запущен.\nИспользуйте /status для статистики.")
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
@@ -253,16 +222,33 @@ async def cmd_status(message: types.Message):
 
 # --- Main Engine ---
 
+TOURNAMENT_LOCATIONS = {
+    "Australian Open": (37.8136, 144.9631), "Wimbledon": (51.4343, 0.2145), "French Open": (48.8475, 2.2492),
+    "US Open": (40.7500, -73.8467), "Indian Wells": (33.7233, -116.3750), "Miami": (25.9581, -80.2389),
+    "Monte Carlo": (43.7483, 7.4331), "Madrid": (40.4168, -3.7038), "Rome": (41.9028, 12.4964),
+}
+
+SURFACE_MAPPING = {
+    "Australian Open": "Hard", "Wimbledon": "Grass", "French Open": "Clay", "US Open": "Hard",
+    "Indian Wells": "Hard", "Miami": "Hard", "Monte Carlo": "Clay", "Madrid": "Clay", "Rome": "Clay",
+}
+
+def get_tournament_surface(sport_title: str) -> str:
+    for name, surface in SURFACE_MAPPING.items():
+        if name.lower() in sport_title.lower(): return surface
+    return "Hard"
+
+def get_tournament_coords(sport_title: str) -> Tuple[float, float]:
+    for name, coords in TOURNAMENT_LOCATIONS.items():
+        if name.lower() in sport_title.lower(): return coords
+    return (0.0, 0.0)
+
 async def scan_matches(bot: Bot):
     logger.info("Starting scan cycle...")
-    df_stats = await get_combined_stats()
-    active_sports = await get_active_tennis_sports()
-    
+    active_sports = await get_active_atp_sports()
     if not active_sports:
-        logger.warning("No active tennis (ATP) sports found.")
+        logger.warning("No active ATP sports found.")
         return
-    
-    logger.info(f"Scanning sports: {active_sports}")
 
     for sport_slug in active_sports:
         odds_data = await get_odds(sport_slug)
@@ -273,12 +259,14 @@ async def scan_matches(bot: Bot):
             sport_title = match.get('sport_title', 'Unknown')
             surface = get_tournament_surface(sport_title)
             
-            if surface not in ["Hard", "Grass", "Carpet", "Indoor Hard"]:
+            if surface not in ["Hard", "Grass", "Indoor Hard", "Carpet"]:
                 stats_funnel["skipped_surface"] += 1; continue
                 
-            p1, p2 = normalize_name(match['home_team']), normalize_name(match['away_team'])
-            h1, r1, count1 = calculate_weighted_stats(p1, surface, df_stats)
-            h2, r2, count2 = calculate_weighted_stats(p2, surface, df_stats)
+            p1, p2 = match['home_team'], match['away_team']
+            
+            # Parsing On-Demand
+            h1, r1, count1 = await fetch_player_stats(p1, surface)
+            h2, r2, count2 = await fetch_player_stats(p2, surface)
             
             if count1 < 15 or count2 < 15:
                 stats_funnel["skipped_hold"] += 1; continue
@@ -303,7 +291,6 @@ async def scan_matches(bot: Bot):
             min_target_odds = fair_odds * 1.05
             
             best_odds, bookie_name = 0, ""
-            # Включаем totals_1st_set в поиск
             possible_keys = ['alternate_total_games_1st_set', 'total_games_1st_set', 'totals_1st_set', 'totals']
             for bookmaker in match.get('bookmakers', []):
                 for market in bookmaker.get('markets', []):
