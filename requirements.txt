@@ -1,0 +1,8 @@
+aiogram>=3.0.0
+aiohttp
+pandas
+scipy
+tenacity
+python-dotenv
+python-dateutil
+requests
