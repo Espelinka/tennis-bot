@@ -67,16 +67,12 @@ async def get_combined_stats() -> pd.DataFrame:
     if datetime.now() < _stats_cache["expiry"] and not _stats_cache["df"].empty:
         return _stats_cache["df"]
 
-    # Try current and previous years, fallback to 2024/2023 if 404
     years_to_try = [2026, 2025, 2024, 2023]
     dfs = []
-    
     for year in years_to_try:
         df = await download_csv(year)
         if not df.empty:
             dfs.append(df)
-        
-        # We need at least 2 years of data for 52-week coverage
         if len(dfs) >= 2:
             break
             
@@ -142,7 +138,10 @@ def calculate_weighted_stats(player_name: str, surface: str, df: pd.DataFrame) -
         return 0.0, 0.0, len(p_matches)
 
     p_matches['date'] = pd.to_datetime(p_matches['tourney_date'], format='%Y%m%d')
-    cutoff_date = datetime.now() - timedelta(days=60)
+    
+    # ПРАВКА GEMINI: Динамический расчет cutoff_date от последнего матча в базе
+    latest_match_date = p_matches['date'].max()
+    cutoff_date = latest_match_date - timedelta(days=60)
     
     holds, returns, weights = [], [], []
     for _, row in p_matches.iterrows():
@@ -192,16 +191,27 @@ async def get_active_tennis_sports() -> List[str]:
         async with session.get(url, params={"apiKey": ODDS_API_KEY}) as resp:
             if resp.status == 200:
                 all_sports = await resp.json()
-                return [s['key'] for s in all_sports if s['key'].startswith('tennis') and s['active']]
+                # ПРАВКА GEMINI: Фильтруем только ATP турниры
+                return [s['key'] for s in all_sports if s['key'].startswith('tennis_atp') and s['active']]
     return []
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
 async def get_odds(sport_slug: str) -> List[dict]:
     url = f"https://api.the-odds-api.com/v4/sports/{sport_slug}/odds"
-    params = {"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "alternate_total_games_1st_set,h2h", "oddsFormat": "decimal"}
+    # ПРАВКА GEMINI: Расширяем список маркетов
+    params = {
+        "apiKey": ODDS_API_KEY, 
+        "regions": "eu", 
+        "markets": "alternate_total_games_1st_set,totals_1st_set,totals,h2h", 
+        "oddsFormat": "decimal"
+    }
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
-            if resp.status == 200: return await resp.json()
+            if resp.status == 200: 
+                return await resp.json()
+            else:
+                error_text = await resp.text()
+                logger.error(f"Odds API Error for {sport_slug}: {resp.status} - {error_text}")
     return []
 
 # --- PocketBase Integration ---
@@ -249,7 +259,7 @@ async def scan_matches(bot: Bot):
     active_sports = await get_active_tennis_sports()
     
     if not active_sports:
-        logger.warning("No active tennis sports found.")
+        logger.warning("No active tennis (ATP) sports found.")
         return
     
     logger.info(f"Scanning sports: {active_sports}")
@@ -293,7 +303,8 @@ async def scan_matches(bot: Bot):
             min_target_odds = fair_odds * 1.05
             
             best_odds, bookie_name = 0, ""
-            possible_keys = ['alternate_total_games_1st_set', 'total_games_1st_set', 'totals']
+            # Включаем totals_1st_set в поиск
+            possible_keys = ['alternate_total_games_1st_set', 'total_games_1st_set', 'totals_1st_set', 'totals']
             for bookmaker in match.get('bookmakers', []):
                 for market in bookmaker.get('markets', []):
                     if market['key'] in possible_keys:
