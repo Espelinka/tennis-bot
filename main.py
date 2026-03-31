@@ -47,7 +47,25 @@ TOUR_AVG_RETURN = 0.22
 # --- Parsing Logic (TennisAbstract On-Demand) ---
 
 def player_to_url(name: str) -> str:
-    camel_case = "".join(filter(str.isalnum, name.title()))
+    """
+    Normalizes player name from Odds API to TennisAbstract URL format.
+    Example: 'C. Alcaraz Garfia' -> 'https://www.tennisabstract.com/cgi-bin/player.cgi?p=CAlcaraz'
+    or 'Daniil Medvedev' -> 'https://www.tennisabstract.com/cgi-bin/player.cgi?p=DaniilMedvedev'
+    """
+    # 1. Убираем точки и лишние пробелы
+    clean_name = name.replace('.', '').strip()
+    
+    # 2. Разбиваем имя на части
+    parts = clean_name.split()
+    
+    # 3. Берем первую часть (имя/инициал) и последнюю (основная фамилия)
+    if len(parts) >= 2:
+        first_name = parts[0].title()
+        last_name = parts[-1].title()
+        camel_case = "".join(filter(str.isalnum, f"{first_name}{last_name}"))
+    else:
+        camel_case = "".join(filter(str.isalnum, clean_name.title()))
+        
     return f"https://www.tennisabstract.com/cgi-bin/player.cgi?p={camel_case}"
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(5))
